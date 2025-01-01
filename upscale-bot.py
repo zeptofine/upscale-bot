@@ -1,6 +1,7 @@
 # Standard library imports
 import asyncio
 import configparser
+import datetime
 import gc
 import io
 import sys
@@ -10,6 +11,8 @@ import traceback
 from io import BytesIO
 import logging
 from logging.handlers import RotatingFileHandler
+from typing import Union
+import aiohttp.http_parser
 import psutil
 import subprocess
 
@@ -19,12 +22,14 @@ import discord
 import numpy as np
 import torch
 from PIL import Image, UnidentifiedImageError
+from PIL.ImageFile import ImageFile
 from discord.ext import commands
 import spandrel
 import spandrel_extra_arches
+import validators
 
 # Local module imports
-from utils.alpha_handler import handle_alpha
+from utils.alpha_handler import AlphaHandling, handle_alpha
 from utils.fuzzy_model_matcher import find_closest_models, search_models
 from utils.image_info import get_image_info, format_image_info
 from utils.resize_module import resize_command
@@ -54,6 +59,7 @@ config.read('config.ini')
 # Constants
 TOKEN = config['Discord']['Token']
 ADMIN_ID = config['Discord']['AdminId']
+EPHEMERAL = config['Discord']['EphemeralErrorHandling'].lower() == "true"
 MODEL_PATH = config['Paths']['ModelPath']
 MAX_TILE_SIZE = int(config['Processing']['MaxTileSize'])
 PRECISION = config['Processing'].get('Precision', 'auto').lower()
@@ -247,7 +253,9 @@ async def download_image(url):
             except Exception as e:
                 return None, f"Error processing the image: {str(e)}"
 
-def upscale_image(image, model, tile_size, alpha_handling, has_alpha, precision, check_cancelled):
+
+
+def upscale_image(image, model, tile_size, alpha_handling: AlphaHandling, has_alpha, precision, check_cancelled):
     def upscale_func(img):
         img_tensor = torch.from_numpy(np.array(img)).permute(2, 0, 1).float().div_(255.0).unsqueeze(0).cuda()
         _, _, h, w = img_tensor.shape
@@ -296,6 +304,8 @@ def upscale_image(image, model, tile_size, alpha_handling, has_alpha, precision,
 # Bot event handlers
 @bot.event
 async def on_ready():
+    commands = await bot.tree.sync()
+    logger.info(f'Synced {len(commands)} commands to command tree: {commands}')
     logger.info(f'{bot.user} has connected to Discord!')
     logger.info("Note: This bot is configured to work only in servers, not in DMs.")
 
@@ -308,125 +318,122 @@ async def on_command_error(ctx, error):
         raise error
 
 # Bot commands
-@bot.command()
+@bot.hybrid_command()
 async def help(ctx):
     """Shows the help message"""
     await ctx.send(help_text)
 
-@bot.command()
-async def upscale(ctx, *args):
-    status_msg = None
-    selection_msg = None
-    try:
-        bot.progress_logger.log_step("Initializing upscale command")
-        
-        # Check if any arguments were provided
-        if not args:
-            await ctx.send(help_text)
-            bot.progress_logger.clear_step()
-            return
-        
-        # Parse arguments
-        model_name = args[0]
-        image_url = None
-        alpha_handling = None
 
-        if len(args) >= 1:
-            model_name = args[0]
-        if len(args) >= 2:
-            if args[1] in ['upscale', 'resize', 'discard']:
-                alpha_handling = args[1]
-                if len(args) >= 3:
-                    image_url = args[2]
-            elif args[1].startswith('http'):
-                image_url = args[1]
-            else:
-                await ctx.send(f"Invalid alpha handling option or image URL: {args[1]}. Using default alpha handling.")
-        if len(args) >= 3 and not image_url:
-            image_url = args[2]
-        
-        if model_name is None:
-            await ctx.send(help_text)
-            bot.progress_logger.clear_step()
-            return
+async def resolve_model_conflict(ctx: commands.Context, model_name: str) -> Union[str, None]:
+    available_models = list_available_models()
+    if model_name in available_models:
+        return model_name
 
-        alpha_handling = alpha_handling if alpha_handling else DEFAULT_ALPHA_HANDLING
-        if alpha_handling not in ['upscale', 'resize', 'discard']:
-            await ctx.send(f"Invalid alpha handling option: {alpha_handling}. Using default: {DEFAULT_ALPHA_HANDLING}")
-            alpha_handling = DEFAULT_ALPHA_HANDLING
-
-        # Model selection and validation
-        available_models = list_available_models()
-        if model_name not in available_models:
-            closest_matches = find_closest_models(model_name, available_models)
-            if closest_matches:
-                if len(closest_matches) == 1 or (closest_matches[0][1] - closest_matches[1][1] > 5):
-                    best_match, similarity, match_type = closest_matches[0]
-                    model_name = best_match
-                    await ctx.send(f"Using model: {model_name} (similarity: {similarity}%, match type: {match_type})")
+    # model is not available: find closest model
+    closest_matches = find_closest_models(model_name, available_models)
+    if closest_matches:
+        if len(closest_matches) == 1 or (closest_matches[0][1] - closest_matches[1][1] > 5):
+            best_match, similarity, match_type = closest_matches[0]
+            model_name = best_match
+            await ctx.send(f"Using model: {model_name} (similarity: {similarity}%, match type: {match_type})")
+            return model_name
+        else:
+            match_message = f"Model '{model_name}' not found. Multiple close matches found.\n\nPlease select a number:"
+            for i, (match, similarity, match_type) in enumerate(closest_matches, 1):
+                match_message += f"\n{i}. {match} (similarity: {similarity}%, match type: {match_type})"
+            match_message += "\n\nOr type 'cancel' to abort."
+            
+            await ctx.send(match_message)
+            
+            def check(m: discord.Message):
+                return m.author == ctx.author and m.channel == ctx.channel and (m.content.isdigit() or m.content.lower() == 'cancel')
+            
+            try:
+                reply = await bot.wait_for('message', check=check, timeout=30.0)
+                if reply.content.lower() == 'cancel':
+                    await ctx.send("Upscale operation cancelled.")
+                    return
+                selection = int(reply.content)
+                if 1 <= selection <= len(closest_matches):
+                    model_name = closest_matches[selection-1][0]
+                    await ctx.send(f"Selected model: {model_name}")
+                    return model_name
                 else:
-                    match_message = f"Model '{model_name}' not found. Multiple close matches found.\n\nPlease select a number:"
-                    for i, (match, similarity, match_type) in enumerate(closest_matches, 1):
-                        match_message += f"\n{i}. {match} (similarity: {similarity}%, match type: {match_type})"
-                    match_message += "\n\nOr type 'cancel' to abort."
-                    
-                    selection_msg = await ctx.send(match_message)
-                    
-                    def check(m):
-                        return m.author == ctx.author and m.channel == ctx.channel and (m.content.isdigit() or m.content.lower() == 'cancel')
-                    
-                    try:
-                        reply = await bot.wait_for('message', check=check, timeout=30.0)
-                        if reply.content.lower() == 'cancel':
-                            await ctx.send("Upscale operation cancelled.")
-                            return
-                        selection = int(reply.content)
-                        if 1 <= selection <= len(closest_matches):
-                            model_name = closest_matches[selection-1][0]
-                            await ctx.send(f"Selected model: {model_name}")
-                        else:
-                            await ctx.send("Invalid selection. Upscale operation cancelled.")
-                            return
-                    except asyncio.TimeoutError:
-                        await ctx.send("Selection timed out. Upscale operation cancelled.")
-                        return
-            else:
-                await ctx.send(f"Model '{model_name}' not found and no close matches. Use --models to see available models.")
+                    await ctx.send("Invalid selection. Upscale operation cancelled.")
+                    return
+            except asyncio.TimeoutError:
+                await ctx.send("Selection timed out. Upscale operation cancelled.")
                 return
+    else:
+        await ctx.send(f"Model '{model_name}' not found and no close matches. Use --models to see available models.")
+        return
+
+class UpscaleFlags(commands.FlagConverter):
+    model_name: str = commands.flag(description="The model to run")
+    alpha_handling: AlphaHandling = commands.flag(default=AlphaHandling.from_str(DEFAULT_ALPHA_HANDLING), description="How to handle the alpha channel of an image")
+
+
+@bot.hybrid_group()
+async def upscale(ctx):
+    print("UPSCALE!")
+
+
+# /upscale image [ img: attachment ] [ model_name: str ] +1 more
+#                                                        [ alpha_handling: AlphaHandling ]
+@upscale.command()
+async def image(ctx: commands.Context, flags: UpscaleFlags, img: discord.Attachment):
+    bot.progress_logger.log_step("Reading attached image")
+    try:
+        async with asyncio.timeout(OTHER_STEP_TIMEOUT):
+            image_data = await img.read()
+            image = Image.open(BytesIO(image_data))
+    except asyncio.TimeoutError:
+        await ctx.send("Error: Image reading took too long and was cancelled.", ephemeral=EPHEMERAL)
+        return
+    
+    await __upscale(ctx, image=image, img_url=img.url, flags=flags)
+
+
+# /upscale link [ link: URL ] [ model_name: str] +1 more
+#                                                [ alpha_handling: AlphaHandling ]
+@upscale.command()
+async def link(ctx: commands.Context, flags: UpscaleFlags, link: str):
+    if not validators.url(link):
+        await ctx.send("Link is not a valid URL!", mention_author=True, ephemeral=EPHEMERAL)
+        return
+
+    bot.progress_logger.log_step("Downloading image from URL")
+    try:
+        async with asyncio.timeout(OTHER_STEP_TIMEOUT):
+            image, error_message = await download_image(link)
+        if image is None:
+            await ctx.send(f"Error: {error_message} Please try uploading the image directly to Discord.", mention_author=True, ephemeral=EPHEMERAL)
+            return
+    except asyncio.TimeoutError:
+        await ctx.send("Error: Image download took too long and was cancelled.", mention_author=True, ephemeral=EPHEMERAL)
+        return
+
+    await __upscale(ctx, image=image, img_url=link, flags=flags)
+
+def build_submission_embed(ctx: commands.Context, img_url: str):
+    embed = discord.Embed(
+        color=discord.Color.random(),
+        timestamp=datetime.datetime.utcnow(),
+    )
+    embed.add_field(name="recipient", value=f"<@{ctx.author}>")
+    embed.set_image(url=img_url)
+    return embed
+
+async def __upscale(ctx: commands.Context, img_url: str, image: ImageFile, flags: UpscaleFlags):
+    try:
+        model_name = await resolve_model_conflict(ctx, flags.model_name)
+        if model_name is None:
+            return
 
         # Load the model descriptor and check input channels
         model_descriptor = load_model(model_name)
         if model_descriptor.input_channels == 4:
-            await ctx.send("4 channel models are not supported, please pick another model.")
-            return
-
-        # Image acquisition (from attachment or URL)
-        if len(ctx.message.attachments) > 0:
-            attachment = ctx.message.attachments[0]
-            if not attachment.filename.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
-                await ctx.send("Please upload a valid image file (PNG, JPG, JPEG, or WebP).")
-                return
-            bot.progress_logger.log_step("Reading attached image")
-            try:
-                async with asyncio.timeout(OTHER_STEP_TIMEOUT):
-                    image_data = await attachment.read()
-                    image = Image.open(BytesIO(image_data))
-            except asyncio.TimeoutError:
-                await ctx.send("Error: Image reading took too long and was cancelled.")
-                return
-        elif image_url:
-            bot.progress_logger.log_step("Downloading image from URL")
-            try:
-                async with asyncio.timeout(OTHER_STEP_TIMEOUT):
-                    image, error_message = await download_image(image_url)
-                if image is None:
-                    await ctx.send(f"Error: {error_message} Please try uploading the image directly to Discord.")
-                    return
-            except asyncio.TimeoutError:
-                await ctx.send("Error: Image download took too long and was cancelled.")
-                return
-        else:
-            await ctx.send("Please either attach an image or provide a valid image URL.")
+            await ctx.send("4 channel models are not supported, please pick another model.", ephemeral=EPHEMERAL)
             return
 
         # Calculate the output image size
@@ -439,34 +446,33 @@ async def upscale(ctx, *args):
         # Check if the output size exceeds the limit
         if output_total_pixels > MAX_OUTPUT_TOTAL_PIXELS:
             max_megapixels = MAX_OUTPUT_TOTAL_PIXELS / (1024 * 1024)
-            await ctx.send(f"Error: The output image size ({output_width}x{output_height}, {output_total_pixels / (1024 * 1024):.2f} megapixels) would exceed the maximum allowed total of {max_megapixels:.2f} megapixels ({MAX_OUTPUT_TOTAL_PIXELS:,} pixels).")
+            await ctx.send(f"Error: The output image size ({output_width}x{output_height}, {output_total_pixels / (1024 * 1024):.2f} megapixels) would exceed the maximum allowed total of {max_megapixels:.2f} megapixels ({MAX_OUTPUT_TOTAL_PIXELS:,} pixels).", ephemeral=EPHEMERAL)
             return
 
         # Check if the image has an alpha channel
         has_alpha = image.mode in ('RGBA', 'LA') or (image.mode == 'P' and 'transparency' in image.info)
 
         # Queue the upscale operation
-        status_msg = await ctx.send("Your upscale request has been queued.")
+        
+        status_embed = build_submission_embed(ctx, img_url)
+        status_msg = await ctx.send("Your upscale request has been queued.",embed=status_embed)
         
         # Add the task to the queue
-        await bot.upscale_queue.put(process_upscale(ctx, model_name, image, status_msg, alpha_handling, has_alpha))
+        await bot.upscale_queue.put(process_upscale(ctx, model_name, image, status_msg, flags.alpha_handling, has_alpha))
 
     except Exception as e:
+        bot.progress_logger.clear_step()
         error_message = f"<@{ADMIN_ID}> Error! {str(e)}"
         await ctx.send(error_message)
         logger.error("Error in upscale command:")
         traceback.print_exc()
-    finally:
-        # Ensure we clean up the selection message if it exists
-        if selection_msg:
-            await selection_msg.delete()
-        
+
 @bot.command(aliases=['scale'])
 async def resize(ctx, *args):
     await resize_command(ctx, args, download_image, GAMMA_CORRECTION)
 
 @bot.command(name='models')
-async def list_models(ctx, search_term: str = None):
+async def list_models(ctx, search_term: Union[str, None] = None):
     available_models = list_available_models()
     if not available_models:
         await ctx.send("No models are currently available.")
@@ -539,7 +545,7 @@ async def info(ctx, *args):
         if 'file_path' in locals() and os.path.exists(file_path):
             os.remove(file_path)
 
-async def process_upscale(ctx, model_name, image, status_msg, alpha_handling, has_alpha):
+async def process_upscale(ctx: commands.Context, model_name, image: ImageFile, status_msg: discord.Message, alpha_handling: AlphaHandling, has_alpha):
     try:
         start_time = time.time()
         
@@ -704,16 +710,15 @@ async def process_upscale(ctx, model_name, image, status_msg, alpha_handling, ha
             async with asyncio.timeout(OTHER_STEP_TIMEOUT):
                 message = f"<@{ctx.author.id}> Here's your image upscaled with `{model_name}`"
                 if has_alpha:
-                    message += f" and alpha method `{alpha_handling}`"
+                    message += f" and alpha method `{alpha_handling.name}`"
                 if compression_info:
                     message += f"\nNote: The image was saved as {save_format} with {compression_info} due to size limitations."
                 await ctx.send(message, file=discord.File(fp=output_buffer, filename=new_filename))
                 
-                final_status = f"{status_content}\nUpscale completed in {upscale_time:.2f} seconds\nCompressing completed in {compression_time:.2f} seconds\nUpload successful!"
+                final_status = f"Upscale completed in {upscale_time:.2f} seconds!"
                 await status_msg.edit(content=final_status)
-                
                 await asyncio.sleep(5)
-                await status_msg.delete()
+
         except asyncio.TimeoutError:
             await status_msg.edit(content="Error: Image upload took too long and was cancelled.")
             return
@@ -777,10 +782,6 @@ async def process_upscale(ctx, model_name, image, status_msg, alpha_handling, ha
         torch.cuda.empty_cache()
         gc.collect()
         logger.info("Upscale cleanup completed, returned to idle state.")
-        try:
-            await status_msg.delete()
-        except discord.HTTPException:
-            pass
 
 # Main execution
 if __name__ == "__main__":

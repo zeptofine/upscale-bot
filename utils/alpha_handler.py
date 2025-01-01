@@ -1,10 +1,30 @@
+from enum import Enum
 import numpy as np
 from PIL import Image
 from .resize_module import resize_image
 
-def handle_alpha(image, upscale_func, alpha_handling, gamma_correction):
+
+class AlphaHandling(Enum):
+    resize = 2
+    """Resize the alpha channel"""
+    upscale = 1
+    """Upscale as well"""
+    discard = 3
+    """Discard the alpha channel"""
+    @classmethod
+    def from_str(cls, s: str):
+        if s == "resize":
+            return cls.resize
+        if s == "upscale":
+            return cls.upscale
+        if s == "discard":
+            return cls.discard
+        raise KeyError (f"No valid AlphaHandling for the given string: {s}")
+
+
+def handle_alpha(image, upscale_func, alpha_handling: AlphaHandling, gamma_correction):
     # Early return for 'discard' option to avoid unnecessary conversions
-    if alpha_handling == 'discard':
+    if alpha_handling == AlphaHandling.discard:
         return upscale_func(image.convert('RGB'))
 
     # Convert image to RGB
@@ -13,7 +33,7 @@ def handle_alpha(image, upscale_func, alpha_handling, gamma_correction):
     # Upscale RGB Portion
     upscaled_rgb = upscale_func(rgb_image)
 
-    if alpha_handling == 'upscale':
+    if alpha_handling == AlphaHandling.upscale:
         # Create a 3-channel image from the alpha channel
         alpha_array = np.array(alpha)
         alpha_3channel = np.stack([alpha_array, alpha_array, alpha_array], axis=2)
@@ -24,7 +44,7 @@ def handle_alpha(image, upscale_func, alpha_handling, gamma_correction):
         
         # Extract a single channel from the result
         upscaled_alpha = upscaled_alpha_3channel.split()[0]
-    elif alpha_handling == 'resize':
+    elif alpha_handling == AlphaHandling.resize:
         # Calculate the scale factor based on the upscaled RGB image
         scale_factor = upscaled_rgb.width / image.width
         
